@@ -42,3 +42,33 @@ EdgePulse 是一个运行于 Cloudflare Workers 边缘计算无服务器环境�
              │  MS-SSTP (PPP / PAP / IPCP / Synthetic TCP)
              ▼
       [ 目标网络出口节点 ] -> 最终访问目标互联网资源
+
+
+# 🚀 快速上手
+方式一：网页端一键粘贴部署 (适合新手)
+
+登录 Cloudflare Dashboard，进入 Compute (Workers) -> Workers & Pages。
+
+点击 Create Application -> Create Worker，输入名称（如 edge-pulse）并点击保存。
+
+进入 Worker 管理界面，点击右上角 Edit code，将仓库中的 _worker.js 代码全选粘贴进去，点击 Deploy。
+
+绑定 KV 存储：
+
+在左侧菜单进入 Storage & Databases -> KV，点击 Create Namespace，命名为 EDGE_KV。
+
+回到该 Worker 的 Settings -> Variables -> KV Namespace Bindings，添加绑定：
+
+Variable name：KV
+
+KV namespace：选择刚才创建的 EDGE_KV
+
+设置私有密钥：
+
+在 Settings -> Variables -> Environment Variables 中添加环境变量：
+
+变量名：TOKEN
+
+变量值：设置你的私有密码（例如 MySecurePass2026）
+
+打开分配的域名即可进入控制面板。
