@@ -301,23 +301,74 @@ async function probeAllRelaysConcurrently(nodes, verifierEndpoint, concurrency =
   return results;
 }
 
+// ===========================================================================
+// 优选接入点标准化解析
+// ===========================================================================
+function normalizeEntryHost(raw) {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.startsWith('#')) return null;
+
+  // 截断行内备注标签（如 #CF 电信优选）
+  const clean = trimmed.split('#')[0].trim();
+  if (!clean) return null;
+
+  let host = clean;
+  let port = 443;
+
+  // 兼容 IPv6 [2606:4700::1]:8443 或 [2606:4700::1]
+  if (clean.startsWith('[')) {
+    const closeIdx = clean.indexOf(']');
+    if (closeIdx !== -1) {
+      host = clean.slice(0, closeIdx + 1);
+      const rest = clean.slice(closeIdx + 1);
+      if (rest.startsWith(':')) {
+        const p = parseInt(rest.slice(1), 10);
+        if (!isNaN(p) && p > 0 && p <= 65535) port = p;
+      }
+    }
+  } else {
+    // 兼容 IPv4 / 域名，提取末尾端口
+    const lastColonIdx = clean.lastIndexOf(':');
+    if (lastColonIdx !== -1) {
+      const p = parseInt(clean.slice(lastColonIdx + 1), 10);
+      if (!isNaN(p) && p > 0 && p <= 65535) {
+        host = clean.slice(0, lastColonIdx);
+        port = p;
+      }
+    }
+  }
+
+  if (!host) return null;
+  return `${host}:${port}`;
+}
+
 async function loadRoutingEntrypoints(env) {
+  const parseList = (text) => {
+    return text
+      .split(/[\r\n,]+/)
+      .map(normalizeEntryHost)
+      .filter(Boolean);
+  };
+
   const remoteUrl = (env.EDGE_HOSTS_URL || "").trim();
   if (remoteUrl) {
     try {
       const res = await fetch(remoteUrl);
       if (res.ok) {
         const text = await res.text();
-        const list = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#') && l.includes(':'));
+        const list = parseList(text);
         if (list.length > 0) return list;
       }
     } catch {}
   }
+
   const envHosts = (env.EDGE_HOSTS || "").trim();
   if (envHosts) {
-    const list = envHosts.split(",").map(s => s.trim()).filter(Boolean);
+    const list = parseList(envHosts);
     if (list.length > 0) return list;
   }
+
   return DEFAULT_ENTRY_HOSTS;
 }
 
@@ -425,8 +476,9 @@ function buildNodeTopology(report, edgeHosts, hostDomain, uuid) {
     let counter = 1;
     for (const node of group.nodes) {
       const entry = entries[entryIdx++ % entries.length];
-      const [eHost, ePortStr] = entry.includes(":") ? entry.split(":") : [entry, "443"];
-      const ePort = parseInt(ePortStr, 10) || 443;
+      const lastColon = entry.lastIndexOf(':');
+      const eHost = lastColon !== -1 ? entry.slice(0, lastColon) : entry;
+      const ePort = lastColon !== -1 ? parseInt(entry.slice(lastColon + 1), 10) || 443 : 443;
       const typeTag = node.residential === "residential" ? "住宅" : "机房";
       const name = `${zhName}-${typeTag}-${String(counter++).padStart(2, "0")}`;
 
@@ -458,7 +510,6 @@ function buildNodeTopology(report, edgeHosts, hostDomain, uuid) {
   return list;
 }
 
-// 依照规范构建纯节点列表
 function buildMihomoJsonListYaml(nodes) {
   const proto = ["vl", "ess"].join("");
   const lines = nodes.map(n => {
