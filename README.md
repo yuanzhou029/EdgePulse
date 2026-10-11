@@ -72,3 +72,50 @@ KV namespace：选择刚才创建的 EDGE_KV
 变量值：设置你的私有密码（例如 MySecurePass2026）
 
 打开分配的域名即可进入控制面板。
+
+# 方式二：使用 Wrangler CLI 命令行部署 (适合开发者)
+```
+# 1. 克隆代码仓库
+git clone [https://github.com/your-username/EdgePulse.git](https://github.com/your-username/EdgePulse.git)
+cd EdgePulse
+
+# 2. 登录 Cloudflare
+npx wrangler login
+
+# 3. 创建 KV 命名空间
+npx wrangler kv:namespace create "KV"
+# 将输出的 id 替换到 wrangler.toml 中
+
+# 4. 部署至 Worker
+npx wrangler deploy
+```
+变量名	             必填	       默认值	                 说明
+TOKEN	             建议	      空 (公开)	           管理凭据。配置后，导出订阅和手动重新测活必须输入此密码。
+UUID	             否	        内置默认 UUID	       客户端连接 VLESS 节点所用的唯一身份识别码。
+EDGE_HOSTS	       否	     内置优选域名列表	       自定义 CDN 入口优选域名，多个域名用英文逗号 , 分隔。
+EDGE_HOSTS_URL	   否         	空	               远程优选域名 txt 文件的拉取地址（优先级高于 EDGE_HOSTS）。
+CHECK_WORKER	     否	      内置公共测活端	        用于探测中继连通性的健康检查代理端 URL。
+MAX_CHECK_NODES	   否	        0 (全量)	          单次检测节点数量上限。设为 0 代表全量并发测活。
+
+```
+📋 订阅导入指南
+访问你的 Worker 域名，在页面右上角点击 “🔑 授权设置” 输入你的 Token，随后可一键复制：
+
+通用订阅 (Base64)
+
+链接格式：https://你的域名/sub?token=你的Token
+
+适用于：v2rayN、Shadowrocket、Sing-box 等。浏览器直接打开将直接展示 Base64 文本，不强制弹出下载窗口。
+
+Mihomo 订阅 (YAML 纯节点)
+
+链接格式：https://你的域名/sub?target=mihomo&token=你的Token
+
+适用于：Mihomo、Clash Verge Rev、Mihomo Party、Sub-Store。输出符合 Mihomo 规范的标准 proxies 列表。
+
+原生 SSTP 直连列表
+
+链接格式：https://你的域名/nodes.txt?token=你的Token
+
+包含未封装的原生 SSTP 服务器连接串，可直接用于 Windows 内置 VPN 客户端拨号。
+```
