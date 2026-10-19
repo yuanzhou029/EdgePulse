@@ -1,8 +1,18 @@
 name = "v20251104"
-main = "_worker.js"
+main = "hx_worker.js"
 compatibility_date = "2025-11-04"
-keep_vars = true
 
-#[[kv_namespaces]]
-#binding = "KV"			#KV绑定名默认不可修改
-#id = ""				#KV数据库id
+[[kv_namespaces]]
+binding = "KV"			#KV绑定名默认不可修改
+id = "6d79e8fb5bd549609a7a45804ba4bc88"				#KV数据库id
+
+[vars]
+CHECK_WORKER = https://check.socks5.cmliussss.net/check?sstp=vpn:vpn@
+EDGE_HOSTS_URL = https://cf.090227.xyz/ct?ips=6
+TOKEN = yuanzhou029
+UUID = da160d5e-e944-45bb-83da-16f115645648
+MAX_CHECK_NODES = 0
+
+
+[triggers]
+crons = ["*/10 * * * *"]
