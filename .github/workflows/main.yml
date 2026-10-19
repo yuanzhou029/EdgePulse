@@ -1,0 +1,24 @@
+name: Trigger EdgePulse Auto Refresh
+
+on:
+  schedule:
+    # UTC 时间每隔 4 小时触发一次（选在第 15 分钟触发，避开整点拥堵）
+    # 对应北京时间 (UTC+8): 00:15, 04:15, 08:15, 12:15, 16:15, 20:15
+    - cron: '15 */4 * * *'
+  workflow_dispatch: # 支持在 GitHub 网页上手动点击按钮立即测试运行
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Refresh Request
+        run: |
+          echo "Sending POST request..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://e48fa153.v20251104-dj6.pages.dev/update?token=yuanzhou029")
+          echo "HTTP Response Status: $STATUS"
+          if [ "$STATUS" -eq 200 ]; then
+            echo "Successfully triggered!"
+          else
+            echo "Failed with status code: $STATUS"
+            exit 1
+          fi
