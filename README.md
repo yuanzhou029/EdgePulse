@@ -100,6 +100,15 @@ npx wrangler deploy
 | `CHECK_WORKER` | 否 | 内置公共测活端 | 用于探测中继连通性的健康检查代理端 URL。 |
 | `MAX_CHECK_NODES` | 否 | 0 (全量) | 单次检测节点数量上限。设为 `0` 代表全量并发测活。 |
 ```
+```
+顶层字段
+字段	含义
+name = "v20251104"	部署的项目名
+main = "_worker.js"	入口文件是根目录的 _worker.js（Pages Advanced Mode 下，该文件被当作 Worker 入口）
+compatibility_date = "2025-11-04"	锁定 Workers 运行时行为版本，相当于固定 API 兼容基准
+keep_vars = true	Pages 专属参数：部署时保留 Dashboard 里已设置的环境变量，与 [vars] 合并；不设这个值时，wrangler.toml 会覆盖 Dashboard 上的变量
+```
+
 📋 订阅导入指南
 访问你的 Worker 域名，在页面右上角点击 “🔑 授权设置” 输入你的 Token，随后可一键复制：
 
