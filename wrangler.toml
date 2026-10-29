@@ -1,18 +1,17 @@
-name = "v20251104"
-main = "hx_worker.js"
-compatibility_date = "2025-11-04"
+name = "v20261027"
+pages_build_output_dir = "public"
+compatibility_date = "2026-10-27"
 
 [[kv_namespaces]]
 binding = "KV"			#KV绑定名默认不可修改
-id = "6d79e8fb5bd549609a7a45804ba4bc88"				#KV数据库id
+id = "f37a43*******fd872cd6c5"				#KV数据库id
 
 [vars]
-CHECK_WORKER = https://check.socks5.cmliussss.net/check?sstp=vpn:vpn@
-EDGE_HOSTS_URL = https://cf.090227.xyz/ct?ips=6
-TOKEN = yuanzhou029
-UUID = da160d5e-e944-45bb-83da-16f115645648
-MAX_CHECK_NODES = 0
-
-
-[triggers]
-crons = ["*/10 * * * *"]
+PROBE_API_URL = "https://8787-agqxk6eozxdhet7cudioaeegmi.instabox.tech"
+UPSTREAM_SOURCES = "https://gx.51281868.xyz/SSTP.txt?token=********#50,https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt#150,https://www.vpngate.net/api/iphone#60"
+PROBE_TOKEN = "*********************"
+MAX_ALIVE_NODES = "socks5:10,sstp:20"
+EDGE_HOSTS = "cf.877774.xyz:443"
+TOKEN = "*********"
+UUID = "da160d5e-e944-45bb-83da-16f115645648"
+EDGE_HOSTS_URL = "https://gx.51281868.xyz/chip.txt?token=*********"
