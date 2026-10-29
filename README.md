@@ -93,40 +93,40 @@ npx wrangler deploy
 
 | 变量名 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `TOKEN` | 建议 | 空 (公开) | 管理凭据。配置后，导出订阅和手动重新测活必须输入此密码。 |
+| `UPSTREAM_SOURCES` | 否 | 包含 VPNGate 及多个 SOCKS5 优质源 | **统一多源配置**。多个源用逗号 `,` 或换行分隔，支持 `URL#最大抓取数` 语法限制单源抓取上限（如 `https://...#15`）。自动兼容识别 VPNGate CSV、JSON 订阅及纯代理列表。 |
+| `PROBE_API_URL` | 否 | 内置默认演示探针 | **VPS 测活探针地址**。指向您的 VPS `probe-api` 服务地址（例如 `https://probe.yourdomain.com`）。 |
+| `PROBE_TOKEN` | 否 | 空 (免密) | **探针访问密钥**。若 VPS 端启用了 `PROBE_TOKEN` 鉴权，在此填入对应口令；若 VPS 端未启用，此项留空即可。 |
+| `MAX_ALIVE_NODES` | 否 | `20` | **最终存活节点入库上限**。测活完成后会按**延时升序**精选最优节点。<br>• 填单个数字：如 `20`，全局只保留延时最低的前 20 个。<br>• 填分协议配额：如 `socks5:10,sstp:10`，分别保留延时最低的各 10 个节点。 |
+| `TOKEN` / `SUB_TOKEN`| 建议 | 空 (公开) | 管理凭据。配置后，导出订阅和手动重新测活必须输入此密码。 |
 | `UUID` | 否 | 内置默认 UUID | 客户端连接 VLESS 节点所用的唯一身份识别码。 |
 | `EDGE_HOSTS` | 否 | 内置优选域名列表 | 自定义 CDN 入口优选域名，多个域名用英文逗号 `,` 分隔。 |
 | `EDGE_HOSTS_URL` | 否 | 空 | 远程优选域名 txt 文件的拉取地址（优先级高于 `EDGE_HOSTS`）。 |
-| `CHECK_WORKER` | 否 | 内置公共测活端 | 用于探测中继连通性的健康检查代理端 URL。 |
-| `MAX_CHECK_NODES` | 否 | 0 (全量) | 单次检测节点数量上限。设为 `0` 代表全量并发测活。 |
-```
-```
-顶层字段
-字段	含义
-name = "v20251104"	部署的项目名
-main = "_worker.js"	入口文件是根目录的 _worker.js（Pages Advanced Mode 下，该文件被当作 Worker 入口）
-compatibility_date = "2025-11-04"	锁定 Workers 运行时行为版本，相当于固定 API 兼容基准
-keep_vars = true	Pages 专属参数：部署时保留 Dashboard 里已设置的环境变量，与 [vars] 合并；不设这个值时，wrangler.toml 会覆盖 Dashboard 上的变量
-```
 
-📋 订阅导入指南
-访问你的 Worker 域名，在页面右上角点击 “🔑 授权设置” 输入你的 Token，随后可一键复制：
+### 内部安全硬编码指标
+- `HARD_MAX_PROBE_TARGETS = 2000`：单次进入测活的候选节点最大上限，超量自动截断以保护 VPS 资源。
+- `CHUNK_SIZE = 100`：发往 VPS 探针批量接口时按 100 节点/批切片分批提交，避免触发探针 `BATCH_LIMIT = 200` 拦截错误与 Worker fetch 超时。
+- `MAX_RETRY_ROUNDS = 3`：成活为 0 时自动间隔 5 秒重试 3 次；3 次均为空坚决不覆盖 KV 数据库，保留历史节点兜底。
 
-通用订阅 (Base64)
+---
 
-链接格式：https://你的域名/sub?token=你的Token
+## 📋 订阅导入指南
+访问你的 Worker 域名，在页面导航栏中可一键复制：
 
-适用于：v2rayN、Shadowrocket、Sing-box 等。浏览器直接打开将直接展示 Base64 文本，不强制弹出下载窗口。
+1. **通用订阅 (Base64)**
+   - 链接格式：`https://你的域名/sub?token=你的Token`
+   - 适用于：v2rayN、Shadowrocket、Sing-box 等。浏览器直接打开将直接展示 Base64 文本，不强制弹出下载窗口。
 
-Mihomo 订阅 (YAML 纯节点)
+2. **Mihomo 订阅 (YAML 纯节点)**
+   - 链接格式：`https://你的域名/sub?target=mihomo&token=你的Token`
+   - 适用于：Mihomo、Clash Verge Rev、Mihomo Party、Sub-Store。输出符合 Mihomo 规范的标准 proxies 列表。
 
-链接格式：https://你的域名/sub?target=mihomo&token=你的Token
+3. **🔥 Mihomo 链式落地专用订阅 (dialer-proxy)**
+   - 链接格式：`https://你的域名/sub?target=mihomo&token=你的Token&dialer_proxy=🛫%20链式前置`
+   - 适用于：将本系统节点作为**落地出口**，并自动在节点配置中注入 `dialer-proxy: "🛫 链式前置"`，直接在 Mihomo 的 `proxy-providers` 中作为落地使用，无需手动写预处理脚本。
 
-适用于：Mihomo、Clash Verge Rev、Mihomo Party、Sub-Store。输出符合 Mihomo 规范的标准 proxies 列表。
+4. **原生节点直连列表**
+   - 链接格式：`https://你的域名/nodes.txt?token=你的Token`
+   - 包含未封装的原生节点连接串，可直接查阅。
 
-原生 SSTP 直连列表
+> 📖 **更详细的部署步骤、架构拓扑与 VPS 探针安装教程，请查阅完整文档：[DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)**
 
-链接格式：https://你的域名/nodes.txt?token=你的Token
-
-包含未封装的原生 SSTP 服务器连接串，可直接用于 Windows 内置 VPN 客户端拨号。
-```
