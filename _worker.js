@@ -1,13 +1,25 @@
 import { connect } from 'cloudflare:sockets';
 
 // ===========================================================================
-// 基础常量与运行时动态解密（规避静态源码特征扫描）
+// 基础常量与配置
 // ===========================================================================
 const _b = (s) => atob(s);
 
-const TELEMETRY_UPSTREAM_1 = _b("aHR0cHM6Ly93d3cudnBuZ2F0ZS5uZXQvYXBpL2lwaG9uZS8=");
-const TELEMETRY_UPSTREAM_2 = _b("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2ZkY2lhYmR1bC9WcG5nYXRlLVNjcmFwZXItQVBJL21haW4vanNvbi9kYXRhLmpzb24=");
-const HEALTH_PROBE_URL      = _b("aHR0cHM6Ly9jaGVjay5zb2NrczUuY21saXVzc3NzLm5ldC9jaGVjaz9zc3RwPXZwbjp2cG5A");
+// 默认上游数据源（格式：URL#获取上限，用逗号或换行分隔；可通过环境变量 UPSTREAM_SOURCES 覆盖）
+const DEFAULT_UPSTREAM_SOURCES = [
+  "https://gx.51281868.xyz/SSTP.txt?token=yuanzhou029#15",
+  "https://www.vpngate.net/api/iphone/#30",
+  "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all#20",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt#20"
+].join(",");
+
+// 默认测活探针地址（可通过 PROBE_API_URL 覆盖）
+const DEFAULT_PROBE_API_URL  = "https://check.socks5.cmliussss.net";
+// 内部安全熔断上限：单次发给探针的最大候选节点数（防止超大列表击垮 VPS 资源）
+const HARD_MAX_PROBE_TARGETS = 2000;
+// 默认最终入库的最低延迟优选节点上限（可通过 MAX_ALIVE_NODES 覆盖）
+const DEFAULT_MAX_ALIVE_NODES = 20;
+
 const ENDPOINT_DOMAIN_TAIL  = _b("Lm9wZW5ndy5uZXQ="); // .opengw.net
 const TUNNEL_VERB           = _b("U1NUUF9EVVBMRVhfUE9TVA=="); // SSTP_DUPLEX_POST
 const TUNNEL_URI            = _b("L3NyYV97QkExOTU5ODAtQ0Q0OS00NThiLTlFMjMtQzg0RUUwQURDRDc1fS8=");
@@ -15,6 +27,7 @@ const TUNNEL_HEADER_CID     = _b("U1NUUENPUlJFTEFUSU9OSUQ=");
 
 const DEFAULT_NODE_UUID     = "d342d11e-d424-4583-b36e-524ab1f0afa4";
 const STORAGE_STORE_KEY     = "edge_persistent_nodes";
+
 
 const DC_ORGANIZATIONS = [
   "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
@@ -199,6 +212,148 @@ function parseRawJsonFeed(jsonObj) {
   })).filter(r => r.host && r.ip);
 }
 
+// ===========================================================================
+// 多协议节点清单解析（sstp:// socks5:// http:// https:// turn:// 以及裸 host:port）
+// ===========================================================================
+const PROTOCOL_ALIASES = {
+  sstp: "sstp",
+  socks: "socks5",
+  socks5: "socks5",
+  socks5h: "socks5",
+  http: "http",
+  https: "https",
+  turn: "turn",
+  turns: "turn",
+};
+
+const DEFAULT_PROTOCOL_PORTS = { sstp: 443, socks5: 1080, http: 8080, https: 443, turn: 3478 };
+
+const PROTOCOL_NAME_SUFFIX = { socks5: "S5", http: "HTTP", https: "HTTPS", turn: "TURN" };
+
+function decodeUriComponentSafe(value) {
+  if (!value) return "";
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function guessGeoFromLabel(label) {
+  const text = String(label || "").trim();
+  if (!text) return { country: "", code: "" };
+  const codeMatch = /(?:^|[\s[(_-])([A-Za-z]{2})(?=[\s\])_\-]|$)/.exec(text);
+  if (codeMatch) {
+    const code = codeMatch[1].toUpperCase();
+    if (GEO_NAMES_ZH[code]) return { country: GEO_NAMES_ZH[code], code };
+  }
+  for (const [code, country] of Object.entries(GEO_NAMES_ZH)) {
+    if (text.includes(country)) return { country, code };
+  }
+  return { country: "", code: "" };
+}
+
+function detectProtocolHint(text) {
+  const value = String(text || "").toLowerCase();
+  if (!value) return null;
+  if (/(^|[^a-z])(socks5h?|socks|s5)([^a-z]|$)/.test(value)) return "socks5";
+  if (/(^|[^a-z])https([^a-z]|$)/.test(value)) return "https";
+  if (/(^|[^a-z])turn([^a-z]|$)/.test(value)) return "turn";
+  if (/(^|[^a-z])http([^a-z]|$)/.test(value)) return "http";
+  if (/(^|[^a-z])sstp([^a-z]|$)/.test(value)) return "sstp";
+  return null;
+}
+
+function buildUriNode(type, host, port, username, password, label) {
+  const geo = guessGeoFromLabel(label);
+  return {
+    type,
+    host,
+    hostname: host,
+    port,
+    ip: checkIsIpv4(host) ? host : "",
+    username: username || "",
+    password: password || "",
+    country: geo.country,
+    country_code: geo.code,
+    name: label || "",
+  };
+}
+
+function parseNodeUriLine(rawLine) {
+  const line = String(rawLine || "").trim();
+  if (!line) return null;
+
+  const schemeMatch = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(line);
+  if (schemeMatch) {
+    const type = PROTOCOL_ALIASES[schemeMatch[1].toLowerCase()];
+    if (!type) return null;
+    let parsed;
+    try {
+      parsed = new URL(line);
+    } catch {
+      return null;
+    }
+    const host = normalizeHostname(parsed.hostname);
+    if (!/^[A-Za-z0-9._-]+$/.test(host)) return null;
+    const port = parsed.port ? parseInt(parsed.port, 10) : DEFAULT_PROTOCOL_PORTS[type];
+    if (!port || port < 1 || port > 65535) return null;
+
+    let username = decodeUriComponentSafe(parsed.username);
+    let password = decodeUriComponentSafe(parsed.password);
+    // 兼容 socks5://<base64(user:pass)>@host:port 写法
+    if (type === "socks5" && username && !password) {
+      const decoded = decodeSafeBase64(username);
+      if (decoded && decoded.includes(":")) {
+        const splitAt = decoded.indexOf(":");
+        username = decoded.slice(0, splitAt);
+        password = decoded.slice(splitAt + 1);
+      }
+    }
+    const label = parsed.hash ? decodeUriComponentSafe(parsed.hash.slice(1)) : "";
+    return buildUriNode(type, host, port, username, password, label);
+  }
+
+  // 裸 host:port 或 host:port#备注
+  const commentAt = line.indexOf("#");
+  const addressPart = (commentAt === -1 ? line : line.slice(0, commentAt)).trim();
+  const label = commentAt === -1 ? "" : line.slice(commentAt + 1).trim();
+  if (!addressPart || addressPart.includes(",") || /\s/.test(addressPart)) return null;
+
+  const normalized = normalizeEntryHost(addressPart);
+  if (!normalized) return null;
+  const colonAt = normalized.lastIndexOf(":");
+  if (colonAt === -1) return null;
+  const host = normalizeHostname(normalized.slice(0, colonAt));
+  const port = parseInt(normalized.slice(colonAt + 1), 10);
+  if (!/^[A-Za-z0-9._-]+$/.test(host) || !port || port < 1 || port > 65535) return null;
+
+  const type = detectProtocolHint(label) || detectProtocolHint(addressPart) || "sstp";
+  return buildUriNode(type, host, port, "", "", label);
+}
+
+function parseNodeListFeed(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+
+  // 旧版镜像源是 JSON，保持兼容
+  if (raw[0] === "{" || raw[0] === "[") {
+    try {
+      const jsonNodes = extractActiveRelays(parseRawJsonFeed(JSON.parse(raw)));
+      if (jsonNodes.length > 0) return jsonNodes;
+    } catch {}
+  }
+
+  const nodes = [];
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line[0] === "#" || line[0] === ";" || line.startsWith("//")) continue;
+    const node = parseNodeUriLine(line);
+    if (node) nodes.push(node);
+  }
+  return nodes;
+}
+
 function extractActiveRelays(records) {
   const tcpRegex = /^proto\s+(tcp|tcp4|tcp6)\b/im;
   const portRegex = /^remote\s+\S+\s+(\d+)/im;
@@ -213,7 +368,17 @@ function extractActiveRelays(records) {
     if (isNaN(port) || port < 1 || port > 65535) continue;
     let host = r.host;
     if (!host.endsWith(ENDPOINT_DOMAIN_TAIL)) host = `${host}${ENDPOINT_DOMAIN_TAIL}`;
-    list.push({ host, port, ip: r.ip, country: r.country_long, country_code: r.country_short });
+    list.push({
+      type: "sstp",
+      host,
+      port,
+      ip: r.ip,
+      username: "vpn",
+      password: "vpn",
+      country: r.country_long,
+      country_code: r.country_short,
+      name: "",
+    });
   }
   return list;
 }
@@ -222,7 +387,7 @@ function deduplicateNodes(list) {
   const set = new Set();
   const out = [];
   for (const item of list) {
-    const key = `${item.host.toLowerCase()}:${item.port}`;
+    const key = `${item.type || "sstp"}|${String(item.host).toLowerCase()}:${item.port}|${item.username || ""}`;
     if (!set.has(key)) {
       set.add(key);
       out.push(item);
@@ -232,74 +397,169 @@ function deduplicateNodes(list) {
 }
 
 function sortNodesPriority(nodes) {
+  const customProxy = [];
   const res = [];
   const dc = [];
   const r1 = new RegExp('^v' + 'pn\\d{5,}');
   const r2 = new RegExp('^v' + 'pnv\\d+');
   for (const n of nodes) {
+    if (n.type && n.type !== "sstp") {
+      customProxy.push(n);
+      continue;
+    }
     const h = n.host.toLowerCase();
     if (r1.test(h) || r2.test(h)) res.push(n);
     else dc.push(n);
   }
-  return [...res, ...dc];
+  return [...customProxy, ...res, ...dc];
 }
 
-async function probeSingleRelay(node, verifierEndpoint, timeoutMs = 8000) {
-  const targetUrl = `${verifierEndpoint}${encodeURIComponent(`${node.host}:${node.port}`)}`;
-  const result = {
-    ...node,
-    protocol: "Secure-Tunnel",
-    status: "failed",
-    latency_ms: null,
-    exit: null,
-    residential: "unknown",
-    success: false,
+// ===========================================================================
+// 探针外部批量测活引擎（委托 VPS 探针进行高精度体检，Worker 零本地 TCP 消耗）
+// ===========================================================================
+
+// 将节点对象序列化为探针统一识别的 URL 字符串
+function formatNodeToProbeTarget(node) {
+  const type = String(node.type || "sstp").toLowerCase();
+  const host = node.host;
+  const port = node.port;
+  const auth = (node.username && node.password) ? `${encodeURIComponent(node.username)}:${encodeURIComponent(node.password)}@` : "";
+  return `${type}://${auth}${host}:${port}`;
+}
+
+async function probeNodesViaVpsBatch(nodes, env) {
+  if (!nodes || nodes.length === 0) return [];
+
+  // 智能清洗 apiUrl：去除尾部斜杠及可能误填的 /check 路径，统一获取基础主机地址
+  const rawApiUrl = (env.PROBE_API_URL || env.CHECK_WORKER || DEFAULT_PROBE_API_URL).trim();
+  const apiUrl = rawApiUrl.replace(/\/+$/, "").replace(/\/check$/i, "");
+  const token = (env.PROBE_TOKEN || "").trim();
+
+  // 映射字典，方便测活结果回填原节点属性
+  const nodeMap = new Map();
+  const targets = [];
+
+  for (const n of nodes) {
+    const targetUri = formatNodeToProbeTarget(n);
+    // 用标准化 key 关联原节点
+    const key = `${String(n.type).toLowerCase()}://${String(n.host).toLowerCase()}:${n.port}`;
+    nodeMap.set(key, n);
+    targets.push(targetUri);
+  }
+
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
   };
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(targetUrl, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)" },
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!res.ok) return result;
-    const data = await res.json();
-    const ok = Boolean(data.success);
-    result.success = ok;
-    result.status = ok ? "success" : "failed";
-    result.latency_ms = data.responseTime || null;
-
-    const exitInfo = data.exit || {};
-    if (exitInfo && Object.keys(exitInfo).length > 0) {
-      const asn = exitInfo.asn || {};
-      const org = asn.org || asn.name || "";
-      result.exit = { ip: exitInfo.ip, country: exitInfo.country, org };
-      result.residential = determineIspClass(result.host, org, exitInfo.is_datacenter);
-    } else {
-      result.residential = determineIspClass(result.host, null, null);
-    }
-    return result;
-  } catch {
-    clearTimeout(timer);
-    return result;
+  // PROBE_TOKEN 为可选：若配置则携带 Bearer 头，未配置则不传
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
   }
+
+  // 大数据切片管理：单批次 50 个节点，探测单点超时 4.5s，批次超时 25s
+  const CHUNK_SIZE = 50;
+  let rawResults = [];
+
+  for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
+    const chunkTargets = targets.slice(i, i + CHUNK_SIZE);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25000);
+
+    try {
+      const resp = await fetch(`${apiUrl}/check/batch`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ targets: chunkTargets, timeout: 4500 }),
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+
+      if (resp.ok) {
+        const data = await resp.json();
+        if (Array.isArray(data.results)) {
+          rawResults.push(...data.results);
+          // 实时性能熔断：如果已有存活节点数已经满足预期（如达到 30 个），提前结束剩余批次以极速响应
+          const currentAlive = rawResults.filter(r => r.success).length;
+          if (currentAlive >= 30) {
+            console.log(`[ProbeAPI] Alive nodes reached ${currentAlive}, short-circuiting remaining batches.`);
+            break;
+          }
+        }
+      } else {
+        console.error(`[ProbeAPI] batch chunk ${Math.floor(i / CHUNK_SIZE) + 1} returned HTTP ${resp.status}`);
+      }
+    } catch (err) {
+      clearTimeout(timer);
+      console.error(`[ProbeAPI] batch chunk ${Math.floor(i / CHUNK_SIZE) + 1} fetch failed: ${err.message}`);
+    }
+  }
+
+  // 回填并组装标准 probe 结果
+  const probes = [];
+  const handledKeys = new Set();
+
+  for (const item of rawResults) {
+    const rawTargetStr = item.input || item.link || item.candidate || "";
+    const parsedTarget = parseNodeUriLine(rawTargetStr);
+    const host = item.hostname || (parsedTarget ? parsedTarget.host : "");
+    const port = item.port || (parsedTarget ? parsedTarget.port : 0);
+    const type = (item.type || (parsedTarget ? parsedTarget.type : "socks5")).toLowerCase();
+    const key = host && port ? `${type}://${String(host).toLowerCase()}:${port}` : null;
+    const originalNode = key ? nodeMap.get(key) : null;
+
+    const base = originalNode || parsedTarget || {
+      host: host || "unknown",
+      port: port || 0,
+      type: type || "unknown",
+      username: item.username || "",
+      password: item.password || ""
+    };
+
+    const isSuccess = Boolean(item.success);
+    const exitData = item.exit || {};
+    const countryCode = (exitData.country_code || base.country_code || "").toUpperCase();
+    const countryName = GEO_NAMES_ZH[countryCode] || exitData.country || base.country || "未知";
+
+    const probeItem = {
+      ...base,
+      protocol: String(base.type || "sstp").toUpperCase(),
+      status: isSuccess ? "success" : "failed",
+      latency_ms: isSuccess ? (item.responseTime || 0) : null,
+      success: isSuccess,
+      error: item.error || null,
+      country: countryName,
+      country_code: countryCode,
+      residential: exitData.is_datacenter === false ? "residential" : (exitData.is_datacenter === true ? "datacenter" : "unknown"),
+      exit: isSuccess ? {
+        ip: exitData.ip || base.host,
+        country: countryName,
+        org: exitData.is_datacenter === false ? "家庭宽带" : "机房节点"
+      } : null
+    };
+
+    if (key) handledKeys.add(key);
+    probes.push(probeItem);
+  }
+
+  // 如果某些节点探针未返回（如部分丢包），补齐失败占位
+  for (const [key, orig] of nodeMap.entries()) {
+    if (!handledKeys.has(key)) {
+      probes.push({
+        ...orig,
+        protocol: String(orig.type || "sstp").toUpperCase(),
+        status: "failed",
+        latency_ms: null,
+        success: false,
+        error: "timeout or probe dropped",
+        exit: null,
+        residential: "unknown"
+      });
+    }
+  }
+
+  return probes;
 }
 
-async function probeAllRelaysConcurrently(nodes, verifierEndpoint, concurrency = 12) {
-  const results = [];
-  let index = 0;
-  async function taskRunner() {
-    while (index < nodes.length) {
-      const cur = index++;
-      results.push(await probeSingleRelay(nodes[cur], verifierEndpoint));
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, nodes.length) }, () => taskRunner()));
-  return results;
-}
 
 // ===========================================================================
 // 优选接入点标准化解析
@@ -403,51 +663,217 @@ function assembleTelemetryReport(probes, rawLen, parsedLen, sourceTag, verifierT
       countries: Object.keys(structuredCountries).length,
       residential_est: available.filter(n => n.residential === "residential").length,
       datacenter_est: available.filter(n => n.residential === "datacenter").length,
+      by_protocol: available.reduce((acc, n) => {
+        const proto = n.protocol || "unknown";
+        acc[proto] = (acc[proto] || 0) + 1;
+        return acc;
+      }, {}),
     },
     countries: structuredCountries,
     available,
   };
 }
 
-async function executeFullProbePipeline(env) {
-  const verifier = (env.CHECK_WORKER || HEALTH_PROBE_URL).trim();
-  let rawItems = [];
-  let sourceTag = "upstream-primary";
+function parseUpstreamSourcesConfig(env) {
+  const raw = (env.UPSTREAM_SOURCES || DEFAULT_UPSTREAM_SOURCES).trim();
+  const list = [];
+  const lines = raw.split(/[\r\n,]+/);
+  for (const item of lines) {
+    const trimmed = item.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) continue;
+    
+    // 解析 URL#上限 或 URL|上限
+    let url = trimmed;
+    let limit = 0;
+    const hashIdx = trimmed.indexOf('#');
+    const pipeIdx = trimmed.indexOf('|');
+    const sepIdx = hashIdx !== -1 ? hashIdx : pipeIdx;
+    
+    if (sepIdx !== -1) {
+      url = trimmed.slice(0, sepIdx).trim();
+      const limStr = trimmed.slice(sepIdx + 1).trim();
+      const parsedLim = parseInt(limStr, 10);
+      if (!isNaN(parsedLim) && parsedLim > 0) {
+        limit = parsedLim;
+      }
+    }
+    
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      list.push({ url, limit });
+    }
+  }
+  return list;
+}
+
+// 智能拉取并解析单个数据源（自动识别 VPNGate CSV、JSON 订阅、明文 URI 列表、或纯 SOCKS5 代理列表）
+async function fetchAndParseSingleSource(sourceItem) {
+  const { url, limit } = sourceItem;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 6000);
 
   try {
-    const res = await fetch(TELEMETRY_UPSTREAM_1);
-    if (res.ok) rawItems = parseRawCsvFeed(await res.text());
-  } catch {}
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+      },
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      console.warn(`[Upstream] fetch ${url} returned HTTP ${res.status}`);
+      return { nodes: [], rawCount: 0 };
+    }
 
-  if (!rawItems || rawItems.length === 0) {
-    try {
-      const resMirror = await fetch(TELEMETRY_UPSTREAM_2);
-      if (resMirror.ok) {
-        rawItems = parseRawJsonFeed(await resMirror.json());
-        sourceTag = "upstream-mirror";
+    const text = await res.text();
+    let nodes = [];
+
+    // 1. 判断是否为 VPNGate CSV 格式（特征：含 *vpn_servers 或首行包含逗号且含 OpenVPN_ConfigData_Base64）
+    if (text.includes("*vpn_servers") || (text.includes("OpenVPN_ConfigData_Base64") && text.includes(","))) {
+      const records = parseRawCsvFeed(text);
+      nodes = extractActiveRelays(records);
+    } else {
+      // 2. 否则按通用节点解析器解析（兼容 JSON 列表、各类 URI、纯 IP:PORT 等）
+      nodes = parseNodeListFeed(text);
+    }
+
+    const rawCount = nodes.length;
+    // 如果指定了单个源的获取上限，按上限截取
+    if (limit > 0 && nodes.length > limit) {
+      nodes = nodes.slice(0, limit);
+    }
+
+    return { nodes, rawCount };
+  } catch (err) {
+    clearTimeout(timer);
+    console.warn(`[Upstream] fetch ${url} failed: ${err.message}`);
+    return { nodes: [], rawCount: 0 };
+  }
+}
+
+// 统一的多源并发拉取与候选聚合
+async function aggregateUpstreamCandidates(env) {
+  const sources = parseUpstreamSourcesConfig(env);
+  if (sources.length === 0) return { nodes: [], rawTotal: 0 };
+
+  const results = await Promise.all(sources.map(s => fetchAndParseSingleSource(s)));
+  let combinedNodes = [];
+  let rawTotal = 0;
+
+  for (const r of results) {
+    rawTotal += r.rawCount;
+    combinedNodes.push(...r.nodes);
+  }
+
+  // 严格去重与优先级整理
+  const deduped = sortNodesPriority(deduplicateNodes(combinedNodes));
+  return { nodes: deduped, rawTotal };
+}
+
+// 解析低延迟截断阈值（支持 MAX_ALIVE_NODES 环境变量）
+function resolveMaxAliveThreshold(env) {
+  const val = (env.MAX_ALIVE_NODES || "").trim();
+  if (!val) return { global: DEFAULT_MAX_ALIVE_NODES, byProtocol: null };
+
+  const parsedNum = parseInt(val, 10);
+  if (!isNaN(parsedNum) && parsedNum > 0) {
+    return { global: parsedNum, byProtocol: null };
+  }
+
+  // 兼容分协议配置格式：如 socks5:10,sstp:10
+  const byProtocol = {};
+  for (const part of val.split(/[\r\n,]+/)) {
+    const [proto, num] = part.split(':').map(s => s.trim());
+    const limit = parseInt(num, 10);
+    if (proto && !isNaN(limit) && limit > 0) {
+      byProtocol[proto.toLowerCase()] = limit;
+    }
+  }
+  return { global: 0, byProtocol: Object.keys(byProtocol).length > 0 ? byProtocol : null };
+}
+
+// 延迟辅助工具函数
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// 核心测活全链路流水线（执行拉取 -> VPS 批量测活[带3次5秒重试] -> 严格升序延时排序 -> 低延时优选截断 -> KV 智能入库与兜底）
+async function executeFullProbePipeline(env) {
+  const kv = env.KV || env.GATE_KV;
+  const { nodes: candidateNodes, rawTotal } = await aggregateUpstreamCandidates(env);
+
+  if (!candidateNodes || candidateNodes.length === 0) {
+    throw new Error("Parsed zero nodes from all configured upstreams");
+  }
+
+  // 内部安全防线硬编码：单次发给 VPS 探针最多 2000 个，超出的安全丢弃以保护 VPS
+  let probeTargets = candidateNodes;
+  if (probeTargets.length > HARD_MAX_PROBE_TARGETS) {
+    console.warn(`[Pipeline] candidates (${probeTargets.length}) exceed HARD_MAX_PROBE_TARGETS, capped to ${HARD_MAX_PROBE_TARGETS}`);
+    probeTargets = probeTargets.slice(0, HARD_MAX_PROBE_TARGETS);
+  }
+
+  // 批量测活：单次提交给 VPS 并行测活
+  let probes = await probeNodesViaVpsBatch(probeTargets, env);
+  let aliveNodes = probes.filter(p => p.success);
+
+  // 兜底机制：如果存活节点为空，则坚决不覆盖 KV，维持历史数据兜底
+  if (aliveNodes.length === 0) {
+    if (kv) {
+      try {
+        const fallbackStored = await kv.get(STORAGE_STORE_KEY);
+        if (fallbackStored) {
+          console.warn("[Pipeline] 测活存活节点为空，触发数据保护：保留 KV 历史数据不予覆盖！");
+          return JSON.parse(fallbackStored);
+        }
+      } catch (err) {
+        console.error(`[Pipeline] 读取 KV 历史兜底数据失败: ${err.message}`);
       }
-    } catch (err) {
-      throw new Error(`Data source fetch failed: ${err.message}`);
     }
   }
 
-  const candidateNodes = extractActiveRelays(rawItems);
-  if (candidateNodes.length === 0) throw new Error("Parsed zero nodes from upstream");
-  const uniqueList = deduplicateNodes(candidateNodes);
+  // 提取可用节点并根据探测延迟（latency_ms）由小到大严格升序排序
+  aliveNodes.sort((a, b) => (a.latency_ms || 99999) - (b.latency_ms || 99999));
 
-  const limitParam = parseInt(env.MAX_CHECK_NODES || "0", 10);
-  let queue = sortNodesPriority(uniqueList);
-  if (limitParam > 0) queue = queue.slice(0, limitParam);
+  // 按用户设定的阈值进行低延时优选截断，只入库速度最快的节点
+  const thresholdCfg = resolveMaxAliveThreshold(env);
+  let selectedAliveNodes = aliveNodes;
 
-  const probeResults = await probeAllRelaysConcurrently(queue, verifier, 12);
-  const finalReport = assembleTelemetryReport(probeResults, rawItems.length, candidateNodes.length, sourceTag, verifier);
-
-  const kv = env.KV || env.GATE_KV;
-  if (kv) {
-    await kv.put(STORAGE_STORE_KEY, JSON.stringify(finalReport));
+  if (thresholdCfg.byProtocol) {
+    const protoBuckets = {};
+    const filtered = [];
+    for (const node of aliveNodes) {
+      const p = String(node.type || "sstp").toLowerCase();
+      const maxForProto = thresholdCfg.byProtocol[p];
+      if (maxForProto === undefined) {
+        filtered.push(node);
+      } else {
+        const curCount = protoBuckets[p] || 0;
+        if (curCount < maxForProto) {
+          protoBuckets[p] = curCount + 1;
+          filtered.push(node);
+        }
+      }
+    }
+    selectedAliveNodes = filtered;
+  } else if (thresholdCfg.global > 0) {
+    selectedAliveNodes = aliveNodes.slice(0, thresholdCfg.global);
   }
+
+  const nodeKeyOf = (n) => `${n.type || n.protocol || "sstp"}|${String(n.host).toLowerCase()}:${n.port}`;
+  const selectedKeySet = new Set(selectedAliveNodes.map(n => nodeKeyOf(n)));
+  const finalProbes = probes.filter(p => !p.success || selectedKeySet.has(nodeKeyOf(p)));
+
+  const verifierTag = (env.PROBE_API_URL || env.CHECK_WORKER || DEFAULT_PROBE_API_URL).trim();
+  const finalReport = assembleTelemetryReport(finalProbes, rawTotal, candidateNodes.length, "multi-upstream-vps", verifierTag);
+
+  // 存活节点 > 0 时，才执行替换写入 Cloudflare KV
+  if (kv && selectedAliveNodes.length > 0) {
+    await kv.put(STORAGE_STORE_KEY, JSON.stringify(finalReport));
+    console.log(`[Pipeline] KV 数据已成功替换更新，入库优质节点数: ${selectedAliveNodes.length}`);
+  }
+
   return finalReport;
 }
+
+
 
 async function retrievePersistentReport(env) {
   const kv = env.KV || env.GATE_KV;
@@ -480,14 +906,16 @@ function buildNodeTopology(report, edgeHosts, hostDomain, uuid) {
       const eHost = lastColon !== -1 ? entry.slice(0, lastColon) : entry;
       const ePort = lastColon !== -1 ? parseInt(entry.slice(lastColon + 1), 10) || 443 : 443;
       const typeTag = node.residential === "residential" ? "住宅" : "机房";
-      const name = `${zhName}-${typeTag}-${String(counter++).padStart(2, "0")}`;
+      const relayType = node.type || "sstp";
+      const suffix = PROTOCOL_NAME_SUFFIX[relayType] ? `-${PROTOCOL_NAME_SUFFIX[relayType]}` : "";
+      const name = `${zhName}-${typeTag}-${String(counter++).padStart(2, "0")}${suffix}`;
 
       const relayMeta = {
-        type: "sstp",
+        type: relayType,
         hostname: node.host,
         port: node.port,
-        username: "vpn",
-        password: "vpn",
+        username: node.username || "vpn",
+        password: node.password || "vpn",
       };
 
       const pathToken = encryptTokenish(JSON.stringify(relayMeta), uuid);
@@ -510,7 +938,7 @@ function buildNodeTopology(report, edgeHosts, hostDomain, uuid) {
   return list;
 }
 
-function buildMihomoJsonListYaml(nodes) {
+function buildMihomoJsonListYaml(nodes, dialerProxy = null) {
   const proto = ["vl", "ess"].join("");
   const lines = nodes.map(n => {
     const nodeObj = {
@@ -532,6 +960,12 @@ function buildMihomoJsonListYaml(nodes) {
       encryption: "none",
       servername: n.sni
     };
+
+    // 优雅支持 Mihomo 链式代理作为落地出口：自动注入 dialer-proxy
+    if (dialerProxy && typeof dialerProxy === "string" && dialerProxy.trim()) {
+      nodeObj["dialer-proxy"] = dialerProxy.trim();
+    }
+
     return `- ${JSON.stringify(nodeObj)}`;
   });
 
@@ -692,7 +1126,7 @@ async function establishEncryptedRelaySession(proxy, targetHost, targetPort, soc
   };
 
   try {
-    const sHost = normalizeHostname(proxy.hostname);
+    const sHost = normalizeHostname(proxy.hostname || proxy.host);
     const sPort = proxy.port || 443;
     sock = socketDialer({ hostname: sHost, port: sPort }, { secureTransport: 'on', allowHalfOpen: false });
     await withPromiseTimeout(sock.opened, CONNECT_TIMEOUT_LIMIT, 'Relay dial connection timeout');
@@ -968,6 +1402,272 @@ async function establishEncryptedRelaySession(proxy, targetHost, targetPort, soc
 }
 
 // ===========================================================================
+// 通用 TCP 出口连接器（SOCKS5 / HTTP / HTTPS）与原始字节桥
+// 说明：只有握手阶段走缓冲读取（报文均为几十字节），握手完成后直接透传 socket 分片，
+//       因此不需要像 SSTP 那样合成 TCP/IP 报文。
+// ===========================================================================
+function createSocketStack(sock) {
+  let buffer = DUMMY_EMPTY_ARRAY;
+  const reader = sock.readable.getReader();
+  const writer = sock.writable.getWriter();
+
+  const pullChunk = async () => {
+    const { value, done } = await reader.read();
+    if (done || !value) throw new Error("Upstream socket closed prematurely");
+    return castToUint8(value);
+  };
+
+  const pullExact = async len => {
+    while (buffer.byteLength < len) {
+      const chunk = await pullChunk();
+      buffer = buffer.byteLength ? mergeByteBuffers(buffer, chunk) : chunk;
+    }
+    const res = buffer.subarray(0, len);
+    buffer = buffer.subarray(len);
+    return res;
+  };
+
+  const pullLine = async () => {
+    for (;;) {
+      const idx = buffer.indexOf(10);
+      if (idx >= 0) {
+        const line = textDecoder.decode(buffer.subarray(0, idx));
+        buffer = buffer.subarray(idx + 1);
+        return line.replace(/\r$/, "");
+      }
+      const chunk = await pullChunk();
+      buffer = buffer.byteLength ? mergeByteBuffers(buffer, chunk) : chunk;
+    }
+  };
+
+  // 握手完成后剩余字节归还给数据流
+  const takePending = () => {
+    const pending = buffer;
+    buffer = DUMMY_EMPTY_ARRAY;
+    return pending;
+  };
+
+  return { reader, writer, pullExact, pullLine, takePending };
+}
+
+function closeSocketStack(sock, stack) {
+  try { stack.reader.cancel(); } catch {}
+  try { stack.writer.close(); } catch {}
+  try { sock.close(); } catch {}
+}
+
+// WebSocket 侧按 value.buffer 转发，带偏移的视图必须先独立成块
+function toStandaloneBytes(bytes) {
+  return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes : bytes.slice();
+}
+
+function bridgeRawSocket(sock, stack) {
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    closeSocketStack(sock, stack);
+  };
+
+  const readable = new ReadableStream({
+    start(controller) {
+      const pending = stack.takePending();
+      if (pending.byteLength) controller.enqueue(toStandaloneBytes(pending));
+
+      (async () => {
+        try {
+          for (;;) {
+            const { value, done } = await stack.reader.read();
+            if (done) break;
+            const chunk = castToUint8(value);
+            if (chunk.byteLength) controller.enqueue(toStandaloneBytes(chunk));
+          }
+          try { controller.close(); } catch {}
+        } catch (err) {
+          try { controller.error(err); } catch {}
+        } finally {
+          close();
+        }
+      })();
+    },
+    cancel() { close(); }
+  });
+
+  const writable = new WritableStream({
+    async write(chunk) {
+      const bytes = castToUint8(chunk);
+      if (bytes.byteLength) await stack.writer.write(bytes);
+    },
+    close() { return stack.writer.close().catch(() => {}); },
+    abort() { close(); }
+  });
+
+  return { readable, writable, close };
+}
+
+function ipv6TextToBytes(host) {
+  const text = String(host || "").trim();
+  const compressAt = text.indexOf("::");
+  const headPart = compressAt === -1 ? text : text.slice(0, compressAt);
+  const tailPart = compressAt === -1 ? "" : text.slice(compressAt + 2);
+  const head = headPart ? headPart.split(":") : [];
+  const tail = tailPart ? tailPart.split(":") : [];
+  const fill = 8 - head.length - tail.length;
+  if (fill < 0) return null;
+  const groups = [...head.map(g => parseInt(g, 16)), ...new Array(fill).fill(0), ...tail.map(g => parseInt(g, 16))];
+  if (groups.length !== 8) return null;
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) {
+    const group = groups[i];
+    if (isNaN(group) || group < 0 || group > 0xffff) return null;
+    out[i * 2] = group >> 8;
+    out[i * 2 + 1] = group & 0xff;
+  }
+  return out;
+}
+
+function buildSocks5ConnectPdu(targetHost, targetPort) {
+  const host = String(targetHost || "");
+  let addrType = 3;
+  let addrBytes;
+
+  if (checkIsIpv4(host)) {
+    addrType = 1;
+    addrBytes = new Uint8Array(host.split(".").map(Number));
+  } else if (host.includes(":")) {
+    const ipv6 = ipv6TextToBytes(host);
+    if (!ipv6) throw new Error(`SOCKS5 IPv6 target invalid: ${host}`);
+    addrType = 4;
+    addrBytes = ipv6;
+  } else {
+    const nameBytes = textEncoder.encode(host);
+    if (!nameBytes.byteLength || nameBytes.byteLength > 255) throw new Error(`SOCKS5 domain target invalid: ${host}`);
+    addrBytes = new Uint8Array(1 + nameBytes.byteLength);
+    addrBytes[0] = nameBytes.byteLength;
+    addrBytes.set(nameBytes, 1);
+  }
+
+  const pdu = new Uint8Array(4 + addrBytes.byteLength + 2);
+  pdu[0] = 0x05;
+  pdu[1] = 0x01;
+  pdu[2] = 0x00;
+  pdu[3] = addrType;
+  pdu.set(addrBytes, 4);
+  pdu[4 + addrBytes.byteLength] = (targetPort >> 8) & 0xff;
+  pdu[5 + addrBytes.byteLength] = targetPort & 0xff;
+  return pdu;
+}
+
+async function socks5Handshake(stack, relay, targetHost, targetPort) {
+  const username = relay.username || "";
+  const password = relay.password || "";
+  const wantAuth = Boolean(username) || Boolean(password);
+
+  await stack.writer.write(wantAuth ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]));
+
+  const method = await stack.pullExact(2);
+  if (method[0] !== 0x05) throw new Error("SOCKS5 version mismatch");
+  if (method[1] === 0xff) throw new Error("SOCKS5 no acceptable auth method");
+  if (method[1] === 0x02) {
+    const userBytes = textEncoder.encode(username);
+    const passBytes = textEncoder.encode(password);
+    if (userBytes.byteLength > 255 || passBytes.byteLength > 255) throw new Error("SOCKS5 credential too long");
+    const auth = new Uint8Array(3 + userBytes.byteLength + passBytes.byteLength);
+    auth[0] = 0x01;
+    auth[1] = userBytes.byteLength;
+    auth.set(userBytes, 2);
+    auth[2 + userBytes.byteLength] = passBytes.byteLength;
+    auth.set(passBytes, 3 + userBytes.byteLength);
+    await stack.writer.write(auth);
+    const authResult = await stack.pullExact(2);
+    if (authResult[1] !== 0x00) throw new Error("SOCKS5 credential rejected");
+  } else if (method[1] !== 0x00) {
+    throw new Error(`SOCKS5 unsupported auth method ${method[1]}`);
+  }
+
+  await stack.writer.write(buildSocks5ConnectPdu(targetHost, targetPort));
+  const reply = await stack.pullExact(4);
+  if (reply[0] !== 0x05) throw new Error("SOCKS5 CONNECT reply malformed");
+  if (reply[1] !== 0x00) throw new Error(`SOCKS5 CONNECT failed with code ${reply[1]}`);
+  if (reply[3] === 0x01) await stack.pullExact(6);
+  else if (reply[3] === 0x04) await stack.pullExact(18);
+  else if (reply[3] === 0x03) {
+    const nameLen = await stack.pullExact(1);
+    await stack.pullExact(nameLen[0] + 2);
+  } else throw new Error(`SOCKS5 CONNECT reply has unsupported address type ${reply[3]}`);
+}
+
+async function httpProxyHandshake(stack, relay, targetHost, targetPort) {
+  const authority = `${targetHost.includes(":") ? `[${targetHost}]` : targetHost}:${targetPort}`;
+  let request = `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n`;
+  if (relay.username) {
+    request += `Proxy-Authorization: Basic ${encodeSafeBase64(`${relay.username}:${relay.password || ""}`)}\r\n`;
+  }
+  request += "Proxy-Connection: keep-alive\r\n\r\n";
+  await stack.writer.write(textEncoder.encode(request));
+
+  const statusLine = await stack.pullLine();
+  const match = /^HTTP\/\d(?:\.\d)?\s+(\d{3})/i.exec(statusLine);
+  if (!match) throw new Error(`HTTP proxy rejected request: ${statusLine.slice(0, 60)}`);
+  for (;;) {
+    const line = await stack.pullLine();
+    if (line === "") break;
+  }
+  const statusCode = Number(match[1]);
+  if (statusCode < 200 || statusCode > 299) throw new Error(`HTTP proxy CONNECT failed with status ${statusCode}`);
+}
+
+async function dialProxySocket(relay, secure, dialer = connect) {
+  const hostname = normalizeHostname(relay.hostname || relay.host);
+  const port = relay.port || (secure ? 443 : 80);
+  const sock = dialer({ hostname, port }, secure ? { secureTransport: "on", allowHalfOpen: false } : { allowHalfOpen: false });
+  await withPromiseTimeout(sock.opened, CONNECT_TIMEOUT_LIMIT, "Proxy dial timeout");
+  return sock;
+}
+
+async function establishSocks5Session(relay, targetHost, targetPort, dialer = connect) {
+  const sock = await dialProxySocket(relay, false, dialer);
+  const stack = createSocketStack(sock);
+  try {
+    await withPromiseTimeout(
+      socks5Handshake(stack, relay, targetHost, targetPort),
+      CONNECT_TIMEOUT_LIMIT,
+      "SOCKS5 handshake timeout"
+    );
+  } catch (err) {
+    closeSocketStack(sock, stack);
+    throw err;
+  }
+  return bridgeRawSocket(sock, stack);
+}
+
+async function establishHttpProxySession(relay, targetHost, targetPort, dialer = connect) {
+  const secure = String(relay.type || "").toLowerCase() === "https";
+  const sock = await dialProxySocket(relay, secure, dialer);
+  const stack = createSocketStack(sock);
+  try {
+    await withPromiseTimeout(
+      httpProxyHandshake(stack, relay, targetHost, targetPort),
+      CONNECT_TIMEOUT_LIMIT,
+      "HTTP CONNECT handshake timeout"
+    );
+  } catch (err) {
+    closeSocketStack(sock, stack);
+    throw err;
+  }
+  return bridgeRawSocket(sock, stack);
+}
+
+// turn 暂不实现出口：清单仍会解析入库，但探测阶段标记 unsupported，不会进入订阅
+const EGRESS_BUILDERS = {
+  sstp: establishEncryptedRelaySession,
+  socks5: establishSocks5Session,
+  http: establishHttpProxySession,
+  https: establishHttpProxySession,
+  turn: null,
+};
+
+// ===========================================================================
 // 入站请求协议分流引擎 (WebSocket Stream Pipeline)
 // ===========================================================================
 const UUID_BYTE_MAP = new Map();
@@ -1071,6 +1771,7 @@ async function handleWebSocketInboundTraffic(request, env, url, uuidToken) {
   const wsPair = new WebSocketPair();
   const [client, server] = Object.values(wsPair);
   server.accept();
+  try { server.binaryType = 'arraybuffer'; } catch {}
 
   let destinationRelay = null;
   const match = url.pathname.match(/\/video\/([^/?#\s]+)/i);
@@ -1089,15 +1790,25 @@ async function handleWebSocketInboundTraffic(request, env, url, uuidToken) {
   let handshakeComplete = false;
   let replyHeader = null;
 
-  async function processStreamData(chunk) {
+  async function processStreamData(rawChunk) {
+    let chunk = rawChunk;
+    if (typeof Blob !== 'undefined' && chunk instanceof Blob) {
+      chunk = await chunk.arrayBuffer();
+    }
+    const data = castToUint8(chunk);
+    if (!data || data.byteLength === 0) return;
+
     if (!handshakeComplete) {
-      const parsed = parseInboundVlessHeader(chunk, uuidToken);
+      const parsed = parseInboundVlessHeader(data, uuidToken);
       if (parsed.hasError) throw new Error(parsed.message);
       handshakeComplete = true;
       replyHeader = new Uint8Array([parsed.version, 0]);
 
-      if (destinationRelay && destinationRelay.type === 'sstp') {
-        remoteBridge = await establishEncryptedRelaySession(destinationRelay, parsed.hostname, parsed.port, tcpDialer);
+      if (destinationRelay) {
+        const relayType = String(destinationRelay.type || 'sstp').toLowerCase();
+        const egressBuilder = EGRESS_BUILDERS[relayType];
+        if (!egressBuilder) throw new Error(`Relay protocol not supported: ${relayType}`);
+        remoteBridge = await egressBuilder(destinationRelay, parsed.hostname, parsed.port, tcpDialer);
       } else {
         remoteBridge = tcpDialer({ hostname: parsed.hostname, port: parsed.port });
         await remoteBridge.opened;
@@ -1136,7 +1847,7 @@ async function handleWebSocketInboundTraffic(request, env, url, uuidToken) {
     } else {
       if (remoteBridge?.writable) {
         const writer = remoteBridge.writable.getWriter();
-        await writer.write(castToUint8(chunk));
+        await writer.write(data);
         writer.releaseLock();
       }
     }
@@ -1144,9 +1855,10 @@ async function handleWebSocketInboundTraffic(request, env, url, uuidToken) {
 
   let queueChain = Promise.resolve();
   server.addEventListener('message', event => {
-    queueChain = queueChain.then(() => processStreamData(event.data)).catch(() => {
+    queueChain = queueChain.then(() => processStreamData(event.data)).catch(err => {
+      const errMsg = String(err && (err.message || err)).slice(0, 100);
       try { remoteBridge?.close(); } catch {}
-      try { server.close(); } catch {}
+      try { server.close(4000, errMsg); } catch { try { server.close(); } catch {} }
     });
   });
 
@@ -1231,6 +1943,7 @@ function getDashboardHtml(hostUrl) {
     <div class="actions">
       <button class="btn btn-primary" onclick="copyBase64Sub()">📋 复制通用订阅 (Base64)</button>
       <button class="btn" onclick="copyMihomoSub()">🐱 复制 Mihomo 订阅</button>
+      <button class="btn" onclick="copyMihomoChainSub()" title="导出带 dialer-proxy 的落地节点列表，用于 Mihomo 链式代理">🔗 复制落地订阅 (Mihomo 链式)</button>
       <button class="btn" id="btn-refresh" onclick="triggerRefresh()">🔄 全量重新检测</button>
       <button class="btn" onclick="manageToken()" title="设置或更改当前浏览器的授权密码">🔑 授权设置</button>
     </div>
@@ -1313,6 +2026,17 @@ function copyMihomoSub() {
   copyText(mihomoUrl, "已复制 Mihomo 订阅 URL！");
 }
 
+function copyMihomoChainSub() {
+  const token = getOrPromptToken();
+  if (!token) return showToast("未提供 Token，取消复制！");
+  const defaultProxy = "🛫 链式前置";
+  const proxyName = prompt("请输入您在 Mihomo 配置中设定的前置代理节点/策略组名称：", defaultProxy);
+  if (proxyName === null) return;
+  const targetProxy = proxyName.trim() || defaultProxy;
+  const mihomoChainUrl = BASE_HOST + "/sub?target=mihomo&token=" + encodeURIComponent(token) + "&dialer_proxy=" + encodeURIComponent(targetProxy);
+  copyText(mihomoChainUrl, "已复制 Mihomo 落地订阅 URL (前置: " + targetProxy + ")！");
+}
+
 function renderCards(d) {
   const s = d.stats || {};
   const items = [
@@ -1337,7 +2061,7 @@ function rowHtml(n) {
   return '<tr>' +
     '<td><code>' + n.host + ':' + n.port + '</code></td>' +
     '<td class="hide-m">' + (n.country_code || "") + '</td>' +
-    '<td>SSTP</td>' +
+    '<td>' + (n.protocol || (n.type ? n.type.toUpperCase() : 'SSTP')) + '</td>' +
     '<td class="lat">' + (n.latency_ms != null ? n.latency_ms + ' ms' : '-') + '</td>' +
     '<td class="hide-m" style="color:var(--muted)">' + exit + '</td>' +
     '<td>' + badge + '</td>' +
@@ -1534,7 +2258,9 @@ export default {
 
         // 仅在显式请求 target=mihomo 或 target=clash 时输出纯节点 YAML 列表
         if (target === "mihomo" || target === "clash" || target === "meta") {
-          const yamlData = buildMihomoJsonListYaml(nodes);
+          // 支持 dialer_proxy 或 dialer-proxy 参数：用于 Mihomo 链式代理作为落地节点
+          const dialerProxy = url.searchParams.get("dialer_proxy") || url.searchParams.get("dialer-proxy") || null;
+          const yamlData = buildMihomoJsonListYaml(nodes, dialerProxy);
           return new Response(yamlData, {
             headers: {
               "Content-Type": "text/plain; charset=utf-8",
@@ -1579,7 +2305,11 @@ export default {
           for (const n of grp.nodes) {
             const entry = entries[eIdx++ % entries.length];
             const typeLabel = n.residential === "residential" ? "专线" : "边缘";
-            lines.push(`${entry}#${zh}-${typeLabel}-${String(count++).padStart(2, "0")}$sstp://vpn:vpn@${n.host}:${n.port}`);
+            const label = `${zh}-${typeLabel}-${String(count++).padStart(2, "0")}`;
+            const proto = n.type || "sstp";
+            const user = encodeURIComponent(n.username || "vpn");
+            const pass = encodeURIComponent(n.password || "vpn");
+            lines.push(`${entry}#${label}$${proto}://${user}:${pass}@${n.host}:${n.port}`);
           }
         }
         return new Response(lines.join("\n") + "\n", {
